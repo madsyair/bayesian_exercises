@@ -1,0 +1,2376 @@
+---
+title: 'WAMBS Checklist: A Guide to Bayesian Analysis'
+author: "Achmad Syahrul Choir"
+institute: "Politeknik Statistika STIS"
+date: "Monthly Research Discussion,June 13, 2025"
+output:
+  beamer_presentation:
+    theme: "Boadilla"
+    colortheme: "default"
+    keep_tex: true
+header-includes:
+  - \usepackage[utf8]{inputenc}
+  - \usepackage{graphicx}
+  - \usepackage{amssymb}
+  - \usepackage{amsmath}
+  - \usepackage{textcomp}
+  - \definecolor{STISRed}{HTML}{9A0501}
+  - \definecolor{STISOrange}{HTML}{F79039}
+  - \definecolor{STISBlack}{HTML}{231F20}
+  - \definecolor{STISLightYellow}{HTML}{FFFBEE}
+  - \setbeamercolor{frametitle}{bg=STISRed,fg=white}
+  - \setbeamercolor{title}{bg=white,fg=STISRed}
+  - \setbeamercolor{subtitle}{fg=STISBlack}
+  - \setbeamercolor{author}{fg=STISBlack}
+  - \setbeamercolor{institute}{fg=STISBlack}
+  - \setbeamercolor{date}{fg=STISBlack}
+  - \setbeamercolor{structure}{fg=STISRed}
+  - \setbeamercolor{palette primary}{bg=STISRed,fg=white}
+  - \setbeamercolor{palette secondary}{bg=STISOrange,fg=white}
+  - \setbeamercolor{palette tertiary}{bg=STISRed,fg=white}
+  - \setbeamercolor{normal text}{bg=white,fg=STISBlack}
+  - |
+    \setbeamertemplate{footline}{
+      \leavevmode%
+      \hbox{%
+      \begin{beamercolorbox}[wd=.5\paperwidth,ht=2.25ex,dp=1ex,center]{author in head/foot}%
+        \usebeamerfont{author in head/foot}\insertshortinstitute
+      \end{beamercolorbox}%
+      \begin{beamercolorbox}[wd=.5\paperwidth,ht=2.25ex,dp=1ex,center]{title in head/foot}%
+        \usebeamerfont{title in head/foot}\insertshorttitle\hspace*{2em} (\insertframenumber/\inserttotalframenumber)
+      \end{beamercolorbox}}%
+      \vskip0pt%
+    }
+    
+---
+
+```{r setup, include=FALSE}
+# Set chunk options for knitr
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.align = 'center', cache = TRUE, error = FALSE,
+                      fig.width = 7, fig.height = 4, out.width = "80%",
+                      size = "scriptsize",tidy=TRUE,warning= FALSE)
+
+# Function to safely install and load packages
+install_and_load <- function(packages) {
+  for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE)) {
+      install.packages(pkg, dependencies = TRUE)
+      library(pkg, character.only = TRUE)
+    }
+  }
+}
+
+# Load required packages with error handling
+required_packages <- c("brms", "ggplot2", "bayesplot", "posterior", "loo", 
+                      "dplyr", "tidyr", "patchwork", "httr")
+
+tryCatch({
+  install_and_load(required_packages)
+}, error = function(e) {
+  cat("Error loading packages:", e$message, "\n")
+})
+
+# Try to load priorsense (optional)
+priorsense_available <- FALSE
+tryCatch({
+  if (!require("priorsense", character.only = TRUE)) {
+    install.packages("priorsense", dependencies = TRUE)
+    library(priorsense)
+  }
+  priorsense_available <- TRUE
+}, error = function(e) {
+  cat("priorsense package not available. Some analyses will be skipped.\n")
+})
+
+# Set Stan options
+#options(mc.cores = parallel::detectCores())
+
+# --- Data Loading and Preparation ---
+data_url <- "https://raw.githubusercontent.com/UtrechtUniversity/BayesianEstimation/main/content/tuesday/phd-delays.csv"
+phd_data <- NULL
+data_loaded <- FALSE
+
+cat("Attempting to download PhD delays data...\n")
+
+tryCatch({
+  response <- GET(data_url)
+  if (status_code(response) == 200) {
+    phd_data_character <- content(response, "text", encoding = "UTF-8")
+    phd_data <- read.csv(text = phd_data_character, sep = ";", stringsAsFactors = FALSE)
+    data_loaded <- TRUE
+    cat("Data successfully loaded!\n")
+  } else {
+    cat("Failed to download data. HTTP status:", status_code(response), "\n")
+  }
+}, error = function(e) {
+  cat("Error downloading data:", e$message, "\n")
+  # Create sample data for demonstration
+  set.seed(123)
+  phd_data <- data.frame(
+    B3_difference_extra = rnorm(333, 9.97, 14.43),
+    E22_Age = runif(333, 26, 69),
+    E22_Age_Squared = NA
+  )
+  phd_data$E22_Age_Squared <- phd_data$E22_Age^2
+  cat("Using simulated data for demonstration.\n")
+})
+
+# Clean and prepare the data
+if (!is.null(phd_data)) {
+  phd_data <- phd_data %>%
+    mutate(
+      delay = as.numeric(as.character(B3_difference_extra)),
+      age = as.numeric(as.character(E22_Age)),
+      age_sq = as.numeric(as.character(E22_Age_Squared))
+    ) %>%
+    select(delay, age, age_sq) %>%
+    drop_na()
+  
+  cat("Data cleaning completed. Sample size:", nrow(phd_data), "\n")
+}
+
+# Define model formula
+model_formula <- bf(delay ~ 0+Intercept+age + age_sq)
+
+# Define priors based on the WAMBS document
+# Note: brms uses standard deviation, not variance
+priors_main_model <- c(
+  set_prior("normal(-35, sqrt(20))", class="b",coef = "Intercept"),
+  set_prior("normal(0.8, sqrt(5))", class = "b", coef = "age"),
+  set_prior("normal(0, sqrt(10))", class = "b", coef = "age_sq"),
+  set_prior("student_t(3, 0, 1)", class = "sigma")
+)
+
+# Fit the main model
+
+if (!is.null(phd_data) && nrow(phd_data) > 0) {
+  cat("Fitting main Bayesian model...\n")
+  tryCatch({
+    model_phd <- brm(
+      formula = model_formula,
+      data = phd_data,
+      prior = priors_main_model,
+      chains = 4,
+      iter = 4000,
+      warmup = 2000,
+#      cores = min(4, parallel::detectCores()),
+      seed = 123,
+      control = list(adapt_delta = 0.95),
+      silent = 2, 
+      refresh = 0
+    )
+    model_fitted <- TRUE
+    cat("Model fitting completed successfully!\n")
+  }, error = function(e) {
+    cat("Error fitting model:", e$message, "\n")
+  })
+}
+
+# Also create a simplified version for prior predictive check
+prior_check_available <- FALSE
+if (!is.null(phd_data) && nrow(phd_data) > 0) {
+  tryCatch({
+    # Test if brms prior predictive sampling works
+    test_prior <- brm(
+      formula = model_formula,
+      data = phd_data[1:50, ], # Use subset for faster testing
+      prior = priors_main_model,
+      sample_prior = "only",
+      chains = 1, iter = 100, warmup = 50,
+      seed = 123, silent = 2, refresh = 0
+    )
+    prior_check_available <- TRUE
+    rm(test_prior) # Clean up
+  }, error = function(e) {
+    cat("Prior predictive sampling test failed, will use manual method\n")
+  })
+}
+```
+
+# Presentation Outline
+
+1. Introduction to the WAMBS Checklist
+2. Case Study: PhD Delay Analysis
+3. The 10 Steps of WAMBS-v2
+4. Implementation with R and `brms`
+5. Best Practices and Conclusions
+
+---
+
+# What is the WAMBS Checklist?
+
+### WAMBS = **W**hen to Worry **A**nd how to avoid the **M**isuse of **B**ayesian **S**tatistics
+
+- **Purpose**: A systematic guide to prevent common errors and enhance the quality of Bayesian analysis
+- **Function**: Acts as a checklist to ensure analysis is transparent, thorough, and reproducible
+- **Evolution**: WAMBS-v2 provides a comprehensive 10-step framework
+- **Goal**: To promote open, verifiable, and trustworthy scientific research using Bayesian methods
+
+---
+
+### Key Motivation
+- Many places where poor research practices can "hide" in Bayesian analysis
+- Particular concerns regarding prior specification and their impact on posterior results
+- Need for systematic approach to improve transparency and reproducibility
+
+---
+
+# The 10 WAMBS-v2 Checklist Points
+
+\scriptsize
+\begin{tabular}{p{0.15\textwidth} p{0.8\textwidth}}
+\hline
+\textbf{Step} & \textbf{Description} \\
+\hline
+\textbf{1} & \textbf{Justify Priors \& Prior Predictive Check}: Ensure priors are domain-based and generate sensible data before seeing actual data. \\
+\textbf{2} & \textbf{Assess Parameter Convergence}: Use multiple diagnostics (trace plots, $\hat{R}$ statistic, ESS) to verify convergence. \\
+\textbf{3} & \textbf{Detect Non-stationarity}: Use split-$\hat{R}$ to identify trends that standard diagnostics might miss. \\
+\textbf{4} & \textbf{Ensure Sufficient Iterations}: Check visual smoothness of posterior distributions and stability through iteration doubling. \\
+\textbf{5} & \textbf{Check Effective Sample Size (ESS)}: Ensure equivalent independent samples are sufficient by examining autocorrelation. \\
+\textbf{6} & \textbf{Examine Marginal Posteriors}: Visually inspect posterior distributions for anomalies and substantive reasonableness. \\
+\textbf{7} & \textbf{Multivariate Prior Sensitivity}: Test robustness to specific changes in informative priors, especially multivariate priors. \\
+\textbf{8} & \textbf{Diffuse Prior Comparison}: Compare with non-informative priors and conduct full prior sensitivity analysis. \\
+\textbf{9} & \textbf{Model Sensitivity Analysis}: Test robustness to changes in model specification (likelihood function). \\
+\textbf{10} & \textbf{Report Findings Bayesianly}: Present entire posterior distribution with proper Bayesian interpretation. \\
+\hline
+\end{tabular}
+
+---
+
+# Case Study: PhD Delay Analysis
+
+### Data Description
+```{r data_description, echo=FALSE}
+if (!is.null(phd_data)) {
+  cat("Source: Van de Schoot, Yerkes, Mouw, & Sonneveld (2013)\n")
+  cat("Sample size:", nrow(phd_data), "PhD recipients in the Netherlands\n")
+  cat("Outcome: delay (months) - Mean =", round(mean(phd_data$delay, na.rm = TRUE), 2), "\n")
+  cat("Predictor: age (years) - Mean =", round(mean(phd_data$age, na.rm = TRUE), 2), "\n")
+  cat("Range: delay from", round(min(phd_data$delay, na.rm = TRUE)), "to", 
+      round(max(phd_data$delay, na.rm = TRUE)), "months\n")
+  cat("Range: age from", round(min(phd_data$age, na.rm = TRUE)), "to", 
+      round(max(phd_data$age, na.rm = TRUE)), "years\n")
+} else {
+  cat("Data not available\n")
+}
+```
+
+---
+
+### Statistical Model
+**Polynomial regression** to explore non-linear relationship between age and PhD delay:
+$$delay = \beta_{intercept} + \beta_{age} \cdot Age + \beta_{age^2} \cdot Age^2 + \epsilon$$
+
+- **Four parameters**: intercept, linear age effect, quadratic age effect, residual variance
+- **Rationale**: Non-linear relationship expected between age and completion delay
+- **Implementation**: Using `brms` package with Stan backend
+
+---
+
+# Step 1: Justify Priors & Prior Predictive Check
+
+### Purpose of Step 1
+- Ensure priors are based on substantive domain knowledge and well-justified
+- Check if combination of priors generates plausible data *before* seeing actual data
+- Detect conflicts between prior assumptions and reasonable expectations
+
+### Prior Specifications (Based on Domain Knowledge)
+
+\scriptsize
+```{r step1_priors, echo=TRUE}
+# Prior specifications based on substantive knowledge
+print(priors_main_model)
+```
+
+\normalsize
+
+---
+
+### Rationale for Prior Choices
+- **Intercept**: $N(-35, \sqrt{20})$ - Expected delay when age = 0 (theoretical extrapolation)
+- **Age effect**: $N(0.8, \sqrt{5})$ - Positive relationship expected (~0.8 months per year)
+- **Age squared**: $N(0, \sqrt{10})$ - No strong prior belief about curvature direction  
+- **Sigma**: $student\_t(3, 0, 10)$ - Weakly informative for residual standard deviation
+
+Ref: Depaoli, S., & Van de Schoot, R. (2017)
+
+### Key Considerations
+- Priors based on domain knowledge and reasonable parameter ranges
+- Not too restrictive to allow data to inform the analysis
+- Avoid improper flat priors that can cause computational issues
+
+---
+
+## Step 1: Prior Predictive Check Implementation
+
+\scriptsize
+```r
+if (!is.null(phd_data) && nrow(phd_data) > 0) {
+  tryCatch({
+    # Fit model sampling only from priors
+    
+    prior_pred_model <- brm(
+      formula = model_formula, data = phd_data,
+      prior = priors_main_model, sample_prior = "only",
+      chains = 2, iter = 4000, warmup = 2000,
+      seed = 123, silent = 2, refresh = 0
+    )
+    
+    # Visualize prior predictive check
+    pp_check(prior_pred_model, type = "dens_overlay", ndraws = 100) +
+      coord_cartesian(xlim = c(-150, 150))
+      ggtitle("Prior Predictive Check: Simulated vs Expected Data Range") +
+      theme_minimal()
+    
+  }, error = function(e) {
+    cat("Prior predictive check failed:", e$message, "\n")
+    plot(1, type="n", main="Prior Predictive Check Not Available")
+  })
+} else {
+  plot(1, type="n", main="Data Not Available")
+}
+```
+
+---
+
+```{r}
+priors_main_model <- c(
+  set_prior("normal(-35, sqrt(20))", class="b",coef = "Intercept"),
+  set_prior("normal(0.8, sqrt(5))", class = "b", coef = "age"),
+  set_prior("normal(0, sqrt(10))", class = "b", coef = "age_sq"),
+  set_prior("student_t(3, 0, 10)", class = "sigma")
+)
+
+# Fit the main model
+invisible(capture.output(
+suppressMessages(suppressWarnings(
+    prior_pred_model0 <- brm(
+      formula = model_formula,
+      data = phd_data,
+      prior = priors_main_model,
+      chains = 4,
+      iter = 4000,
+      warmup = 2000,
+#      cores = min(4, parallel::detectCores()),
+      seed = 123,
+      control = list(adapt_delta = 0.95),
+      silent = 2, 
+      refresh = 0
+    )
+ ))))
+    
+    pp_check(prior_pred_model0, type = "dens_overlay", ndraws = 200) +
+      coord_cartesian(xlim = c(-150, 150))
+          ggtitle("Prior Predictive Check: Simulated vs Expected Data Range") +
+      theme_minimal()
+```
+
+**Key Question**: Do simulated datasets from priors cover reasonable range of delays (-25 to +100 months)?
+
+
+
+---
+
+```{r}
+priors_main_model2 <- c(
+  set_prior("normal(-35, sqrt(20))", class="b",coef = "Intercept"),
+  set_prior("normal(0.8, sqrt(5))", class = "b", coef = "age"),
+  set_prior("normal(0, sqrt(10))", class = "b", coef = "age_sq"),
+  set_prior("student_t(3, 0, 1)", class = "sigma")
+)
+
+# Fit the main model
+invisible(capture.output(
+suppressMessages(suppressWarnings(
+    prior_pred_model <- brm(
+      formula = model_formula,
+      data = phd_data,
+      prior = priors_main_model2,
+      chains = 4,
+      iter = 4000,
+      warmup = 2000,
+#      cores = min(4, parallel::detectCores()),
+      seed = 123,
+      control = list(adapt_delta = 0.95),
+      silent = 2, 
+      refresh = 0
+    )
+ ))))
+    
+    pp_check(prior_pred_model, type = "dens_overlay", ndraws = 200) +
+      coord_cartesian(xlim = c(-50, 100))
+          ggtitle("Prior Predictive Check: Simulated vs Expected Data Range") +
+      theme_minimal()
+```
+
+
+---
+
+# Step 2: Assess Parameter Convergence
+
+### Purpose of Step 2
+- Visually inspect MCMC chains using **trace plots**
+- Ensure chains have reached stationarity and are mixing well
+- Well-behaved chains look like "hairy caterpillars" exploring same parameter space
+
+---
+
+## Step 2: Trace Plots - Code Implementation
+\scriptsize
+
+```r 
+# Basic trace plot for key parameters
+plot(model_phd, N = 4, ask = FALSE, type = "trace", 
+     pars = c("b_Intercept", "b_age"))
+
+# Alternative using bayesplot package
+library(bayesplot)
+mcmc_trace(model_phd, pars = c("b_Intercept", "b_age", "b_age_sq"))
+
+# What to look for in trace plots:
+# 1. Chains should overlap and mix well
+# 2. No systematic trends or drift
+# 3. Stationary behavior around equilibrium
+# 4. "Hairy caterpillar" appearance
+# 5. No chain getting stuck in one region
+
+# Good convergence: chains explore same parameter space
+# Poor convergence: chains separated or trending
+```
+
+---
+
+## Step 2: Trace Plots - Results
+
+```{r step2a_traceplots2, echo=FALSE, fig.height=4, out.width="90%"}
+if (model_fitted) {
+  tryCatch({
+    plot(model_phd, N = 4, ask = FALSE, type = "trace", 
+         pars = c("b_Intercept", "b_age"))
+  }, error = function(e) {
+    cat("Trace plot failed:", e$message, "\n")
+    
+    # Create demonstration trace plots with safer plotting approach
+    tryCatch({
+      set.seed(123)
+      n_iter <- 4000
+      n_chains <- 4
+      
+      # Simulate good convergence
+      # Intercept trace plot
+      intercept_chains <- matrix(NA, n_iter, n_chains)
+      for(i in 1:n_chains) {
+        intercept_chains[, i] <- cumsum(rnorm(n_iter, 0, 0.1)) - 30 + rnorm(1, 0, 2)
+      }
+      
+      # Create first plot
+      plot(1:n_iter, intercept_chains[, 1], type = "l", col = 1, 
+           ylim = range(intercept_chains),
+           main = "Trace plot: b_Intercept (Simulated Good Convergence)",
+           xlab = "Iteration", ylab = "Parameter Value")
+      for(i in 2:n_chains) {
+        lines(1:n_iter, intercept_chains[, i], col = i)
+      }
+      
+    }, error = function(e2) {
+      cat("Demonstration plot also failed:", e2$message, "\n")
+      # Simple fallback
+      plot(1:10, 1:10, main = "Trace Plot Not Available", 
+           xlab = "Iteration", ylab = "Parameter Value")
+      text(5, 5, "Trace plots would show\nchain convergence here", cex = 1.2)
+    })
+  })
+} else {
+  cat("Model not fitted - showing conceptual trace plots\n")
+  
+  tryCatch({
+    # Create conceptual good vs bad trace plots
+    set.seed(123)
+    n_iter <- 2000  # Reduced for faster rendering
+    n_chains <- 3
+    
+    # Good convergence example
+    good_chains <- matrix(NA, n_iter, n_chains)
+    for(i in 1:n_chains) {
+      good_chains[, i] <- cumsum(rnorm(n_iter, 0, 0.1)) + rnorm(1, 0, 0.5)
+    }
+    
+    plot(1:n_iter, good_chains[, 1], type = "l", col = 1, 
+         ylim = range(good_chains),
+         main = "Example: Good Convergence (Chains Mix Well)", 
+         xlab = "Iteration", ylab = "Parameter Value")
+    for(i in 2:n_chains) {
+      lines(1:n_iter, good_chains[, i], col = i)
+    }
+    legend("topright", paste("Chain", 1:n_chains), col = 1:n_chains, lty = 1)
+    
+  }, error = function(e) {
+    cat("Conceptual plot failed:", e$message, "\n")
+    # Ultimate fallback
+    plot(1:10, 1:10, type = "n", 
+         main = "Trace Plot Concept", 
+         xlab = "Iteration", ylab = "Parameter Value")
+    text(5, 8, "Good Trace Plot:", font = 2, cex = 1.2)
+    text(5, 6, "- Chains overlap", cex = 1)
+    text(5, 5, "- No trends", cex = 1)
+    text(5, 4, "- Stationary behavior", cex = 1)
+    text(5, 2, "('Hairy caterpillar' appearance)", cex = 0.9, font = 3)
+  })
+}
+```
+**Interpretation**: 
+
+- **Good**: Overlapping chains, no systematic trends, stationary behavior
+
+- **Poor**: Separated chains, trending, or chains getting stuck in one region
+
+---
+
+# Step 2b: Quantitative Convergence Assessment
+
+### Purpose of Step 2b
+
+- Quantitatively confirm convergence using **$\hat{R}$ statistic**
+- $\hat{R}$ compares within-chain variance to between-chain variance
+- Values close to 1.0 (< 1.01) indicate convergence to same distribution
+
+---
+
+## Step 2b: $\hat{R}$ Diagnostic - Code Implementation
+\scriptsize
+```r 
+# Extract R-hat values for all parameters
+rhat_values <- rhat(model_phd)
+print(rhat_values)
+
+# Check specific thresholds
+good_rhat <- rhat_values < 1.01  # Strict threshold
+acceptable_rhat <- rhat_values < 1.05  # More lenient
+
+# Summary of convergence
+cat("Parameters with R-hat < 1.01:",sum(good_rhat), "/",length(rhat_values),"\n")
+cat("Parameters with R-hat < 1.05:",sum(acceptable_rhat),"/", length(rhat_values),"\n")
+
+# Visualize R-hat distribution
+hist(rhat_values,main="Distribution of R-hat Values",
+    xlab="R-hat",breaks = 20)
+abline(v = 1.01, col = "red", lty = 2, lwd = 2)
+abline(v = 1.05, col = "orange", lty = 2, lwd = 2)
+# Modern Stan also provides split-R-hat which is more sensitive
+# to non-stationarity than classical R-hat
+```
+
+---
+
+## Step 2b: $\hat{R}$ Diagnostic - Results
+
+\scriptsize
+```{r step2b_rhat, echo=FALSE, fig.height=4, out.width="75%"}
+if (model_fitted) {
+  tryCatch({
+    rhat_values <- rhat(model_phd)
+    cat("R-hat values for all parameters:\n")
+    print(round(rhat_values, 4))
+    
+    # Check convergence
+    good_rhat <- sum(rhat_values < 1.01, na.rm = TRUE)
+    total_params <- length(rhat_values[!is.na(rhat_values)])
+    
+    cat("\nConvergence Assessment:\n")
+    cat("Parameters with R-hat < 1.01:", good_rhat, "/", total_params, "\n")
+    cat("All parameters converged (R-hat < 1.01):", all(rhat_values < 1.01, na.rm = TRUE), "\n")
+    
+    # Create histogram of R-hat values
+    if(length(rhat_values) > 1) {
+      hist(rhat_values, main="Distribution of R-hat Values", 
+           xlab="R-hat", col="lightblue", border="black", 
+           breaks = max(10, length(rhat_values)/2))
+      abline(v=1.01, col="red", lty=2, lwd=2)
+      abline(v=1.05, col="orange", lty=2, lwd=2)
+      legend("topright", 
+             c("R-hat = 1.01 (strict)", "R-hat = 1.05 (acceptable)"), 
+             col=c("red", "orange"), lty=2, cex=0.8)
+    } else {
+      barplot(rhat_values, names.arg = names(rhat_values),
+              main = "R-hat Values by Parameter",
+              ylab = "R-hat", col = "lightblue")
+      abline(h = 1.01, col = "red", lty = 2, lwd = 2)
+    }
+    
+  }, error = function(e) {
+    cat("R-hat calculation failed:", e$message, "\n")
+  
+  } )} else {
+    cat("Model not fitted - R-hat values not available\n")
+  }
+    
+
+```
+
+**Split-$\hat{R}$**: Modern Stan implementation includes improved diagnostics for non-stationarity detection.
+
+---
+
+##  Show conceptual R-hat interpretation
+
+```{r step2b_split_rhatsim, echo=FALSE, fig.height=4.5, out.width="80%"}
+  if (model_fitted) {
+ 
+    # Show conceptual R-hat interpretation
+    par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+    
+    # Good R-hat values
+    good_rhats <- runif(20, 1.000, 1.008)
+    hist(good_rhats, main = "Good Convergence", 
+         xlab = "R-hat", col = "lightgreen", 
+         xlim = c(0.99, 1.15), breaks = 10)
+    abline(v = 1.01, col = "red", lty = 2)
+    
+    # Poor R-hat values  
+    poor_rhats <- c(runif(15, 1.000, 1.008), runif(5, 1.05, 1.2))
+    hist(poor_rhats, main = "Poor Convergence", 
+         xlab = "R-hat", col = "lightcoral", 
+         xlim = c(0.99, 1.15), breaks = 10)
+    abline(v = 1.01, col = "red", lty = 2)
+    
+    par(mfrow = c(1, 1))
+  
+} else {
+  cat("Model not fitted - showing conceptual R-hat interpretation\n")
+  
+  # Conceptual demonstration
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  
+  # Simulate good vs bad R-hat distributions
+  set.seed(123)
+  
+  # Good convergence scenario
+  good_rhats <- runif(20, 1.000, 1.008)
+  hist(good_rhats, main = "Good Convergence\n(All R-hat < 1.01)", 
+       xlab = "R-hat", col = "lightgreen", 
+       xlim = c(0.99, 1.15), ylim = c(0, 12))
+  abline(v = 1.01, col = "red", lty = 2, lwd = 2)
+  text(1.07, 10, "Threshold", col = "red", cex = 0.8)
+  
+  # Poor convergence scenario
+  poor_rhats <- c(runif(10, 1.000, 1.008), runif(10, 1.05, 1.2))
+  hist(poor_rhats, main = "Poor Convergence\n(Some R-hat > 1.01)", 
+       xlab = "R-hat", col = "lightcoral", 
+       xlim = c(0.99, 1.15), ylim = c(0, 12))
+  abline(v = 1.01, col = "red", lty = 2, lwd = 2)
+  text(1.07, 10, "Threshold", col = "red", cex = 0.8)
+  
+  par(mfrow = c(1, 1))
+  
+  cat("R-hat Interpretation:\n")
+  cat("- R-hat approx 1.00: Perfect convergence\n")
+  cat("- R-hat < 1.01: Excellent convergence (recommended)\n")
+  cat("- R-hat < 1.05: Acceptable convergence\n") 
+  cat("- R-hat > 1.05: Poor convergence, need more iterations\n")
+}
+```
+
+---
+
+# Step 3: Detect Non-stationarity
+
+There is no need to calculate split-$\hat{R}$ because the latest computation of  split-$\hat{R}$ in stan and brms is explicitly designed to detect bad convergence due to trends, chain divergence, tail weight distribution, and scale differences between chains.
+
+---
+
+# Step 4: Ensure Sufficient Iterations
+
+### Purpose of Step 4
+- Ensure enough posterior samples for reliable distribution representation
+- Check visual smoothness of posterior densities
+- Verify stability by comparing estimates after doubling iterations
+
+---
+
+## Step 4: Iteration Sufficiency - Code Implementation
+
+\scriptsize
+```{r step4_code, echo=TRUE, eval=FALSE}
+# Method 1: Visual inspection of posterior smoothness
+plot(model_phd, type = "dens", 
+     pars = c("b_Intercept", "b_age", "sigma"), ask = FALSE)
+
+# Method 2: Relative bias check by doubling iterations
+fit_doubled_iter <- update(model_phd, iter = 4000, warmup = 2000, 
+                          seed = 456, silent = 2, refresh = 0)
+
+# Compare estimates
+summary_initial <- summary(model_phd)$fixed[, "Estimate"]
+summary_doubled <- summary(fit_doubled_iter)$fixed[, "Estimate"]
+
+# Calculate relative bias
+relative_bias <- 100 * (summary_initial - summary_doubled) / summary_initial
+
+cat("Relative bias for each parameter:\n")
+print(round(relative_bias, 3))
+
+# Rule of thumb: relative bias < 5% indicates sufficient iterations
+sufficient_iterations <- all(abs(relative_bias) < 5, na.rm = TRUE)
+cat("Sufficient iterations (all bias < 5%):", sufficient_iterations, "\n")
+```
+
+---
+
+## Step 4: Posterior Density Smoothness - Results
+
+```{r step4_posterior_density, echo=FALSE, fig.height=4, out.width="80%"}
+if (model_fitted) {
+  tryCatch({
+mcmc_dens(model_phd, 
+          pars = c("b_Intercept", "b_age", "sigma"),
+          facet_args = list(nrow = 2, ncol = 2))
+
+  }, error = function(e) {
+    cat("Posterior density plot failed:", e$message, "\n")
+    
+    # Create demonstration of smooth vs rough posteriors
+    set.seed(123)
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # Smooth posterior (sufficient iterations)
+    x1 <- seq(-40, -20, length.out = 200)
+    y1 <- dnorm(x1, -30, 3)
+    plot(x1, y1, type = "l", lwd = 2, col = "blue",
+         main = "Smooth Posterior\n(Sufficient iterations)",
+         xlab = "b_Intercept", ylab = "Density")
+    
+    # Rough posterior (insufficient iterations)
+    x2 <- seq(-40, -20, length.out = 20)  # Fewer points = rough
+    y2 <- dnorm(x2, -30, 3) + rnorm(20, 0, 0.002)
+    plot(x2, y2, type = "l", lwd = 2, col = "red",
+         main = "Rough Posterior\n(Insufficient iterations)",
+         xlab = "b_Intercept", ylab = "Density")
+    
+    # Smooth posterior for age effect
+    x3 <- seq(-1, 2, length.out = 200)
+    y3 <- dnorm(x3, 0.5, 0.3)
+    plot(x3, y3, type = "l", lwd = 2, col = "blue",
+         main = "Smooth Posterior\n(Age effect)",
+         xlab = "b_age", ylab = "Density")
+    
+    # Bimodal issue (convergence problems)
+    x4 <- seq(-1, 2, length.out = 200)
+    y4 <- 0.6 * dnorm(x4, 0.2, 0.2) + 0.4 * dnorm(x4, 1.2, 0.2)
+    plot(x4, y4, type = "l", lwd = 2, col = "red",
+         main = "Problematic Posterior\n(Multiple modes)",
+         xlab = "b_age", ylab = "Density")
+    
+    par(mfrow = c(1, 1))
+  })
+} else {
+  cat("Model not fitted - showing conceptual posterior shapes\n")
+  
+  # Demonstrate different posterior quality scenarios
+  set.seed(123)
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+  
+  # Good: Smooth unimodal
+  x1 <- seq(-3, 3, length.out = 200)
+  y1 <- dnorm(x1, 0, 1)
+  plot(x1, y1, type = "l", lwd = 3, col = "darkgreen",
+       main = "GOOD: Smooth & Unimodal",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  # Bad: Rough/jagged  
+  x2 <- seq(-3, 3, length.out = 20)
+  y2 <- dnorm(x2, 0, 1) + rnorm(20, 0, 0.05)
+  plot(x2, y2, type = "l", lwd = 3, col = "red",
+       main = "BAD: Rough/Jagged",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  # Bad: Multimodal
+  x3 <- seq(-3, 3, length.out = 200)
+  y3 <- 0.6 * dnorm(x3, -1, 0.4) + 0.4 * dnorm(x3, 1.5, 0.3)
+  plot(x3, y3, type = "l", lwd = 3, col = "red",
+       main = "BAD: Multimodal",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  # Bad: Very wide/flat
+  x4 <- seq(-8, 8, length.out = 200)
+  y4 <- dnorm(x4, 0, 5)
+  plot(x4, y4, type = "l", lwd = 3, col = "orange",
+       main = "QUESTIONABLE: Very Wide",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  par(mfrow = c(1, 1))
+}
+```
+
+---
+
+```{r step4_posterior_density_demo, echo=FALSE, fig.height=4, out.width="80%"}
+if (model_fitted) {
+  tryCatch({
+    
+    # Create demonstration of smooth vs rough posteriors
+    set.seed(123)
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # Smooth posterior (sufficient iterations)
+    x1 <- seq(-40, -20, length.out = 200)
+    y1 <- dnorm(x1, -30, 3)
+    plot(x1, y1, type = "l", lwd = 2, col = "blue",
+         main = "Smooth Posterior\n(Sufficient iterations)",
+         xlab = "b_Intercept", ylab = "Density")
+    
+    # Rough posterior (insufficient iterations)
+    x2 <- seq(-40, -20, length.out = 20)  # Fewer points = rough
+    y2 <- dnorm(x2, -30, 3) + rnorm(20, 0, 0.002)
+    plot(x2, y2, type = "l", lwd = 2, col = "red",
+         main = "Rough Posterior\n(Insufficient iterations)",
+         xlab = "b_Intercept", ylab = "Density")
+    
+    # Smooth posterior for age effect
+    x3 <- seq(-1, 2, length.out = 200)
+    y3 <- dnorm(x3, 0.5, 0.3)
+    plot(x3, y3, type = "l", lwd = 2, col = "blue",
+         main = "Smooth Posterior\n(Age effect)",
+         xlab = "b_age", ylab = "Density")
+    
+    # Bimodal issue (convergence problems)
+    x4 <- seq(-1, 2, length.out = 200)
+    y4 <- 0.6 * dnorm(x4, 0.2, 0.2) + 0.4 * dnorm(x4, 1.2, 0.2)
+    plot(x4, y4, type = "l", lwd = 2, col = "red",
+         main = "Problematic Posterior\n(Multiple modes)",
+         xlab = "b_age", ylab = "Density")
+    
+    par(mfrow = c(1, 1))
+  })
+} else {
+  cat("Model not fitted - showing conceptual posterior shapes\n")
+  
+  # Demonstrate different posterior quality scenarios
+  set.seed(123)
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+  
+  # Good: Smooth unimodal
+  x1 <- seq(-3, 3, length.out = 200)
+  y1 <- dnorm(x1, 0, 1)
+  plot(x1, y1, type = "l", lwd = 3, col = "darkgreen",
+       main = "GOOD: Smooth & Unimodal",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  # Bad: Rough/jagged  
+  x2 <- seq(-3, 3, length.out = 20)
+  y2 <- dnorm(x2, 0, 1) + rnorm(20, 0, 0.05)
+  plot(x2, y2, type = "l", lwd = 3, col = "red",
+       main = "BAD: Rough/Jagged",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  # Bad: Multimodal
+  x3 <- seq(-3, 3, length.out = 200)
+  y3 <- 0.6 * dnorm(x3, -1, 0.4) + 0.4 * dnorm(x3, 1.5, 0.3)
+  plot(x3, y3, type = "l", lwd = 3, col = "red",
+       main = "BAD: Multimodal",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  # Bad: Very wide/flat
+  x4 <- seq(-8, 8, length.out = 200)
+  y4 <- dnorm(x4, 0, 5)
+  plot(x4, y4, type = "l", lwd = 3, col = "orange",
+       main = "QUESTIONABLE: Very Wide",
+       xlab = "Parameter Value", ylab = "Density")
+  
+  par(mfrow = c(1, 1))
+}
+```
+
+---
+
+### Relative Bias Check
+
+```{r step4_bias_check, echo=FALSE}
+if (model_fitted) {
+  cat("For comprehensive iteration sufficiency assessment:\n")
+  cat("1. Visual smoothness check: [CHECKMARK] (see plots above)\n")
+  cat("2. Relative bias check: Compare estimates after doubling iterations\n")
+  cat("3. Rule of thumb: Relative bias < 5% indicates sufficient iterations\n")
+  cat("4. Formula: bias = 100 x (initial - doubled) / initial\n")
+} else {
+  cat("Iteration sufficiency guidelines:\n")
+  cat("- Smooth posteriors indicate sufficient sampling\n")
+  cat("- Rough/jagged posteriors suggest more iterations needed\n")
+  cat("- Relative bias < 5% after doubling iterations is good\n")
+  cat("- Multiple modes may indicate convergence issues\n")
+}
+```
+
+---
+
+# Step 5: Check Effective Sample Size (ESS)
+
+### Purpose of Step 5
+- MCMC samples are correlated; **ESS** estimates equivalent independent samples
+- Low ESS indicates high autocorrelation and less reliable estimates
+- Rule of thumb: **Bulk-ESS > 400** and **Tail-ESS > 400** (chains=4)
+
+---
+
+## Step 5: ESS Assessment - Code Implementation
+
+\scriptsize
+```{r step5_code, echo=TRUE, eval=FALSE}
+# Check ESS values from model summary
+summary_fit <- summary(model_phd)
+cat("ESS values for fixed effects:\n")
+print(summary_fit$fixed[, c("Estimate", "Bulk_ESS", "Tail_ESS")])
+# Check if ESS meets recommended thresholds
+bulk_ess_good <- summary_fit$fixed[, "Bulk_ESS"] > 400
+tail_ess_good <- summary_fit$fixed[, "Tail_ESS"] > 400
+
+cat("Parameters with Bulk_ESS > 400:", sum(bulk_ess_good), "\n")
+cat("Parameters with Tail_ESS > 400:", sum(tail_ess_good), "\n")
+# Examine autocorrelation
+plot(model_phd, type = "acf", 
+     pars = c("b_Intercept", "b_age"), ask = FALSE)
+```
+
+What good autocorrelation looks like:
+
+ - Rapid decay to near zero
+ - Most lags close to zero
+ - No persistent patterns
+
+---
+
+## Step 5: ESS and Autocorrelation - Results
+
+\scriptsize
+```{r step5_ess_results, echo=FALSE, fig.height=4.5, out.width="90%"}
+if (model_fitted) {
+  tryCatch({
+    # Display ESS values
+    summary_fit <- summary(model_phd)
+    cat("=== Effective Sample Size Assessment ===\n")
+    ess_results <- summary_fit$fixed[, c("Estimate", "Bulk_ESS", "Tail_ESS")]
+    print(round(ess_results, 1))
+    
+    # Check thresholds
+    bulk_good <- ess_results[, "Bulk_ESS"] > 400
+    tail_good <- ess_results[, "Tail_ESS"] > 400
+    
+    cat("\nESS Threshold Check (>400 recommended):\n")
+    cat("Bulk-ESS sufficient:", sum(bulk_good), "/", length(bulk_good), "parameters\n")
+    cat("Tail-ESS sufficient:", sum(tail_good), "/", length(tail_good), "parameters\n")
+    
+    # Plot autocorrelation
+ mcmc_acf_bar(model_phd, 
+         pars = c("b_Intercept", "b_age"),
+         lags = 30) #
+    
+  }, error = function(e) {
+    cat("ESS/autocorrelation analysis failed:", e$message, "\n")
+    
+    # Create demonstration of good vs bad autocorrelation
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # Good autocorrelation (rapid decay)
+    lags <- 0:20
+    good_acf <- exp(-lags * 0.3) * (lags == 0) + exp(-lags * 0.3) * 0.1 * (lags > 0)
+    plot(lags, good_acf, type = "h", lwd = 3, col = "blue",
+         main = "Good: Rapid Decay",
+         xlab = "Lag", ylab = "Autocorrelation",
+         ylim = c(-0.2, 1))
+    abline(h = 0, col = "gray")
+    
+    # Bad autocorrelation (slow decay)
+    bad_acf <- exp(-lags * 0.05)
+    plot(lags, bad_acf, type = "h", lwd = 3, col = "red",
+         main = "Bad: Slow Decay",
+         xlab = "Lag", ylab = "Autocorrelation",
+         ylim = c(-0.2, 1))
+    abline(h = 0, col = "gray")
+    
+    # ESS comparison visualization
+    ess_good <- c(800, 1200, 950, 1100)
+    ess_bad <- c(50, 150, 80, 200)
+    
+    barplot(ess_good, names.arg = c("b_Int", "b_age", "b_age2", "sigma"),
+            main = "Good ESS (>400)", ylab = "ESS", col = "lightgreen",
+            ylim = c(0, 12000))
+    abline(h = 400, col = "red", lty = 2, lwd = 2)
+    
+    barplot(ess_bad, names.arg = c("b_Int", "b_age", "b_age2", "sigma"),
+            main = "Poor ESS (<400)", ylab = "ESS", col = "lightcoral",
+            ylim = c(0, 12000))
+    abline(h = 400, col = "red", lty = 2, lwd = 2)
+    
+    par(mfrow = c(1, 1))
+    
+    cat("Demonstrating ESS concepts:\n")
+    cat("- High ESS (>400): More reliable estimates\n")
+    cat("- Low ESS (<400): Less reliable, high autocorrelation\n")
+  })
+} else {
+  cat("Model not fitted - showing ESS and autocorrelation concepts\n")
+  
+  # Conceptual demonstration
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+  
+  # Demonstrate autocorrelation patterns
+  lags <- 0:15
+  
+  # Excellent mixing (ESS ≈ total iterations)
+  excellent_acf <- c(1, rep(0.05, 15)) + rnorm(16, 0, 0.02)
+  excellent_acf[1] <- 1
+  plot(lags, excellent_acf, type = "h", lwd = 3, col = "darkgreen",
+       main = "Excellent Mixing\n(ESS approx 4000)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  # Good mixing 
+  good_acf <- exp(-lags * 0.4)
+  plot(lags, good_acf, type = "h", lwd = 3, col = "blue",
+       main = "Good Mixing\n(ESS approx 1000)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  # Poor mixing
+  poor_acf <- exp(-lags * 0.1)
+  plot(lags, poor_acf, type = "h", lwd = 3, col = "orange",
+       main = "Poor Mixing\n(ESS approx 200)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  # Very poor mixing
+  very_poor_acf <- exp(-lags * 0.02)
+  plot(lags, very_poor_acf, type = "h", lwd = 3, col = "red",
+       main = "Very Poor Mixing\n(ESS approx 50)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  par(mfrow = c(1, 1))
+  
+  cat("ESS Guidelines:\n")
+  cat("- ESS > 1000: Excellent\n")
+  cat("- ESS > 400: Good (minimum recommended)\n") 
+  cat("- ESS < 400: Poor, consider more iterations\n")
+  cat("- ESS < 100: Very poor, likely need model changes\n")
+}
+```
+
+---
+
+
+```{r step5_ess_results_demo, echo=FALSE, fig.height=4.5, out.width="90%"}
+if (model_fitted) {
+  tryCatch({
+    
+    # Create demonstration of good vs bad autocorrelation
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # Good autocorrelation (rapid decay)
+    lags <- 0:20
+    good_acf <- exp(-lags * 0.3) * (lags == 0) + exp(-lags * 0.3) * 0.1 * (lags > 0)
+    plot(lags, good_acf, type = "h", lwd = 3, col = "blue",
+         main = "Good: Rapid Decay",
+         xlab = "Lag", ylab = "Autocorrelation",
+         ylim = c(-0.2, 1))
+    abline(h = 0, col = "gray")
+    
+    # Bad autocorrelation (slow decay)
+    bad_acf <- exp(-lags * 0.05)
+    plot(lags, bad_acf, type = "h", lwd = 3, col = "red",
+         main = "Bad: Slow Decay",
+         xlab = "Lag", ylab = "Autocorrelation",
+         ylim = c(-0.2, 1))
+    abline(h = 0, col = "gray")
+    
+    # ESS comparison visualization
+    ess_good <- c(800, 1200, 950, 1100)
+    ess_bad <- c(50, 150, 80, 200)
+    
+    barplot(ess_good, names.arg = c("b_Int", "b_age", "b_age2", "sigma"),
+            main = "Good ESS (>400)", ylab = "ESS", col = "lightgreen",
+            ylim = c(0, 12000))
+    abline(h = 400, col = "red", lty = 2, lwd = 2)
+    
+    barplot(ess_bad, names.arg = c("b_Int", "b_age", "b_age2", "sigma"),
+            main = "Poor ESS (<400)", ylab = "ESS", col = "lightcoral",
+            ylim = c(0, 12000))
+    abline(h = 400, col = "red", lty = 2, lwd = 2)
+    
+    par(mfrow = c(1, 1))
+    
+    cat("Demonstrating ESS concepts:\n")
+    cat("- High ESS (>400): More reliable estimates\n")
+    cat("- Low ESS (<400): Less reliable, high autocorrelation\n")
+  })
+} else {
+  cat("Model not fitted - showing ESS and autocorrelation concepts\n")
+  
+  # Conceptual demonstration
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+  
+  # Demonstrate autocorrelation patterns
+  lags <- 0:15
+  
+  # Excellent mixing (ESS ≈ total iterations)
+  excellent_acf <- c(1, rep(0.05, 15)) + rnorm(16, 0, 0.02)
+  excellent_acf[1] <- 1
+  plot(lags, excellent_acf, type = "h", lwd = 3, col = "darkgreen",
+       main = "Excellent Mixing\n(ESS approx 4000)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  # Good mixing 
+  good_acf <- exp(-lags * 0.4)
+  plot(lags, good_acf, type = "h", lwd = 3, col = "blue",
+       main = "Good Mixing\n(ESS approx 1000)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  # Poor mixing
+  poor_acf <- exp(-lags * 0.1)
+  plot(lags, poor_acf, type = "h", lwd = 3, col = "orange",
+       main = "Poor Mixing\n(ESS approx 200)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  # Very poor mixing
+  very_poor_acf <- exp(-lags * 0.02)
+  plot(lags, very_poor_acf, type = "h", lwd = 3, col = "red",
+       main = "Very Poor Mixing\n(ESS approx 50)",
+       xlab = "Lag", ylab = "Autocorrelation", ylim = c(-0.1, 1))
+  abline(h = 0, col = "gray")
+  
+  par(mfrow = c(1, 1))
+  
+  cat("ESS Guidelines:\n")
+  cat("- ESS > 1000: Excellent\n")
+  cat("- ESS > 400: Good (minimum recommended)\n") 
+  cat("- ESS < 400: Poor, consider more iterations\n")
+  cat("- ESS < 100: Very poor, likely need model changes\n")
+}
+```
+
+
+---
+
+# Step 6: Examine Marginal Posteriors
+
+### Purpose of Step 6
+
+- Interpret shape and location of posterior distributions
+- Check for substantive reasonableness and potential red flags
+- Look for multimodality, boundary estimates, or implausible values
+
+---
+
+## Step 6: Posterior Interpretation - Code Implementation
+
+\scriptsize
+```{r step6_code, echo=TRUE, eval=FALSE}
+# Visualize marginal posterior distributions
+stanplot(model_phd, type = "dens", 
+         pars = c("b_Intercept", "b_age", "b_age_sq", "sigma"), 
+         prob = 0.95) +
+  ggtitle("Marginal Posterior Distributions") +
+  theme_minimal()
+
+# Alternative visualization
+plot(model_phd, type = "dens", 
+     pars = c("b_Intercept", "b_age", "b_age_sq"), ask = FALSE)
+
+# What to check for:
+# 1. Unimodality (single peak)
+# 2. Clear centering around reasonable values
+# 3. No boundary effects (estimates not pushed to extreme values)
+# 4. Substantive reasonableness of estimates
+# 5. Consistency with prior expectations (but data can override)
+
+# Extract specific posterior summaries
+posterior_summary <- summary(model_phd)$fixed
+print(posterior_summary[, c("Estimate", "l-95% CI", "u-95% CI")])
+```
+
+---
+
+## Step 6: Posterior Distributions - Results
+
+```{r step6_viz_results, echo=FALSE, fig.height=4.2, out.width="90%"}
+if (model_fitted) {
+  tryCatch({
+    stanplot(model_phd, type = "dens", 
+             pars = c("b_Intercept", "b_age", "b_age_sq", "sigma"), 
+             prob = 0.95) +
+      ggtitle("Marginal Posterior Distributions") +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 8),
+            axis.title = element_text(size = 9),
+            plot.title = element_text(size = 11))
+  }, error = function(e) {
+    cat("Posterior interpretation plot failed:", e$message, "\n")
+    
+    # Create demonstration of different posterior shapes
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # Good posterior: unimodal, well-centered
+    x1 <- seq(-40, -20, length.out = 200)
+    y1 <- dnorm(x1, -30, 3)
+    plot(x1, y1, type = "l", lwd = 3, col = "darkgreen",
+         main = "GOOD: Unimodal & Centered",
+         xlab = "b_Intercept", ylab = "Density")
+    
+    # Good posterior: age effect
+    x2 <- seq(-1, 3, length.out = 200)
+    y2 <- dnorm(x2, 0.8, 0.4)
+    plot(x2, y2, type = "l", lwd = 3, col = "darkgreen",
+         main = "GOOD: Reasonable Age Effect",
+         xlab = "b_age", ylab = "Density")
+    
+    # Problematic: multimodal
+    x3 <- seq(-2, 2, length.out = 200)
+    y3 <- 0.6 * dnorm(x3, -0.5, 0.3) + 0.4 * dnorm(x3, 1, 0.2)
+    plot(x3, y3, type = "l", lwd = 3, col = "red",
+         main = "PROBLEM: Multimodal",
+         xlab = "Parameter", ylab = "Density")
+    
+    # Problematic: boundary effect
+    x4 <- seq(0, 4, length.out = 200)
+    y4 <- dgamma(x4, shape = 1, rate = 0.5)
+    plot(x4, y4, type = "l", lwd = 3, col = "orange",
+         main = "QUESTIONABLE: Near Boundary",
+         xlab = "sigma", ylab = "Density")
+    
+    par(mfrow = c(1, 1))
+  })
+} else {
+  cat("Model not fitted - showing conceptual posterior shapes\n")
+  
+  # Demonstrate ideal vs problematic posterior characteristics
+  par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+  
+  # Row 1: Unimodal vs Multimodal
+  x <- seq(-3, 3, length.out = 200)
+  y_good <- dnorm(x, 0, 1)
+  y_bad <- 0.5 * dnorm(x, -1, 0.5) + 0.5 * dnorm(x, 1, 0.5)
+  
+  plot(x, y_good, type = "l", lwd = 3, col = "darkgreen",
+       main = "[CHECKMARK] Unimodal", xlab = "Parameter", ylab = "Density")
+  plot(x, y_bad, type = "l", lwd = 3, col = "red", 
+       main = "[X] Multimodal", xlab = "Parameter", ylab = "Density")
+  
+  # Row 2: Well-centered vs Too wide
+  y_centered <- dnorm(x, 0, 0.5)
+  y_wide <- dnorm(x, 0, 2)
+  
+  plot(x, y_centered, type = "l", lwd = 3, col = "darkgreen",
+       main = "[CHECKMARK] Well-Centered", xlab = "Parameter", ylab = "Density")
+  plot(x, y_wide, type = "l", lwd = 3, col = "orange",
+       main = "[?] Very Wide", xlab = "Parameter", ylab = "Density")
+  
+  # Row 3: Reasonable vs Boundary effect
+  x_pos <- seq(0, 4, length.out = 200)
+  y_reasonable <- dnorm(x_pos, 1.5, 0.5)
+  y_boundary <- dgamma(x_pos, shape = 1, rate = 2)
+  
+  plot(x_pos, y_reasonable, type = "l", lwd = 3, col = "darkgreen",
+       main = "[CHECKMARK] Away from Boundary", xlab = "sigma", ylab = "Density")
+  plot(x_pos, y_boundary, type = "l", lwd = 3, col = "red",
+       main = "[X] Boundary Effect", xlab = "sigma", ylab = "Density")
+  
+  par(mfrow = c(1, 1))
+}
+
+# Display interpretation guidelines
+if (model_fitted) {
+  tryCatch({
+    cat("\n=== Posterior Interpretation Guidelines ===\n")
+    posterior_summary <- summary(model_phd)$fixed
+    cat("Parameter estimates with 95% credible intervals:\n")
+    print(round(posterior_summary[, c("Estimate", "l-95% CI", "u-95% CI")], 3))
+  }, error = function(e) {
+    cat("Could not extract posterior summary\n")
+  })
+} else {
+  cat("\nPosterior Assessment Checklist:\n")
+  cat("[CHECKMARK] Unimodal distributions (single peak)\n")
+  cat("[CHECKMARK] Clear centering around plausible values\n") 
+  cat("[CHECKMARK] No boundary effects (not pushed to constraints)\n")
+  cat("[CHECKMARK] Substantively reasonable estimates\n")
+  cat("[CHECKMARK] Reasonable uncertainty (not too wide/narrow)\n")
+}
+```
+
+---
+
+```{r step6_viz_results_demo, echo=FALSE, fig.height=4.2, out.width="90%"}
+if (model_fitted) {
+  tryCatch({
+    
+    # Create demonstration of different posterior shapes
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # Good posterior: unimodal, well-centered
+    x1 <- seq(-40, -20, length.out = 200)
+    y1 <- dnorm(x1, -30, 3)
+    plot(x1, y1, type = "l", lwd = 3, col = "darkgreen",
+         main = "GOOD: Unimodal & Centered",
+         xlab = "b_Intercept", ylab = "Density")
+    
+    # Good posterior: age effect
+    x2 <- seq(-1, 3, length.out = 200)
+    y2 <- dnorm(x2, 0.8, 0.4)
+    plot(x2, y2, type = "l", lwd = 3, col = "darkgreen",
+         main = "GOOD: Reasonable Age Effect",
+         xlab = "b_age", ylab = "Density")
+    
+    # Problematic: multimodal
+    x3 <- seq(-2, 2, length.out = 200)
+    y3 <- 0.6 * dnorm(x3, -0.5, 0.3) + 0.4 * dnorm(x3, 1, 0.2)
+    plot(x3, y3, type = "l", lwd = 3, col = "red",
+         main = "PROBLEM: Multimodal",
+         xlab = "Parameter", ylab = "Density")
+    
+    # Problematic: boundary effect
+    x4 <- seq(0, 4, length.out = 200)
+    y4 <- dgamma(x4, shape = 1, rate = 0.5)
+    plot(x4, y4, type = "l", lwd = 3, col = "orange",
+         main = "QUESTIONABLE: Near Boundary",
+         xlab = "sigma", ylab = "Density")
+    
+    par(mfrow = c(1, 1))
+  })
+} else {
+  cat("Model not fitted - showing conceptual posterior shapes\n")
+  
+  # Demonstrate ideal vs problematic posterior characteristics
+  par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+  
+  # Row 1: Unimodal vs Multimodal
+  x <- seq(-3, 3, length.out = 200)
+  y_good <- dnorm(x, 0, 1)
+  y_bad <- 0.5 * dnorm(x, -1, 0.5) + 0.5 * dnorm(x, 1, 0.5)
+  
+  plot(x, y_good, type = "l", lwd = 3, col = "darkgreen",
+       main = "[CHECKMARK] Unimodal", xlab = "Parameter", ylab = "Density")
+  plot(x, y_bad, type = "l", lwd = 3, col = "red", 
+       main = "[X] Multimodal", xlab = "Parameter", ylab = "Density")
+  
+  # Row 2: Well-centered vs Too wide
+  y_centered <- dnorm(x, 0, 0.5)
+  y_wide <- dnorm(x, 0, 2)
+  
+  plot(x, y_centered, type = "l", lwd = 3, col = "darkgreen",
+       main = "[CHECKMARK] Well-Centered", xlab = "Parameter", ylab = "Density")
+  plot(x, y_wide, type = "l", lwd = 3, col = "orange",
+       main = "[?] Very Wide", xlab = "Parameter", ylab = "Density")
+  
+  # Row 3: Reasonable vs Boundary effect
+  x_pos <- seq(0, 4, length.out = 200)
+  y_reasonable <- dnorm(x_pos, 1.5, 0.5)
+  y_boundary <- dgamma(x_pos, shape = 1, rate = 2)
+  
+  plot(x_pos, y_reasonable, type = "l", lwd = 3, col = "darkgreen",
+       main = "[CHECKMARK] Away from Boundary", xlab = "sigma", ylab = "Density")
+  plot(x_pos, y_boundary, type = "l", lwd = 3, col = "red",
+       main = "[X] Boundary Effect", xlab = "sigma", ylab = "Density")
+  
+  par(mfrow = c(1, 1))
+}
+
+# Display interpretation guidelines
+if (model_fitted) {
+  tryCatch({
+    cat("\n=== Posterior Interpretation Guidelines ===\n")
+    posterior_summary <- summary(model_phd)$fixed
+    cat("Parameter estimates with 95% credible intervals:\n")
+    print(round(posterior_summary[, c("Estimate", "l-95% CI", "u-95% CI")], 3))
+  }, error = function(e) {
+    cat("Could not extract posterior summary\n")
+  })
+} else {
+  cat("\nPosterior Assessment Checklist:\n")
+  cat("[CHECKMARK] Unimodal distributions (single peak)\n")
+  cat("[CHECKMARK] Clear centering around plausible values\n") 
+  cat("[CHECKMARK] No boundary effects (not pushed to constraints)\n")
+  cat("[CHECKMARK] Substantively reasonable estimates\n")
+  cat("[CHECKMARK] Reasonable uncertainty (not too wide/narrow)\n")
+}
+```
+
+
+---
+
+**Key Checks**: 
+
+- **Unimodal**: Single peak indicates clear parameter identification
+- **Centered**: Clear location estimate, not too diffuse
+- **Substantive**: Estimates make sense in domain context  
+- **No boundaries**: Not constrained by artificial limits
+
+---
+
+# Step 7: Multivariate Prior Sensitivity
+
+### Purpose of Step 7
+- Test robustness to *specific, plausible changes* in informative priors
+- Multivariate priors can be highly influential with small hyperparameter changes
+- Focus on parameters that might be less intuitive (e.g., variance parameters)
+
+---
+
+## Step 7: Prior Sensitivity - Code Implementation
+
+\scriptsize
+
+```{r step7_code, echo=TRUE, eval=FALSE}
+# Define alternative prior for sigma (more diffuse example)
+priors_sigma_diffuse <- c(
+  set_prior("normal(-35, sqrt(20))", class = "b",coef="Intercept"),
+  set_prior("normal(0.8, sqrt(5))", class = "b", coef = "age"),
+  set_prior("normal(0, sqrt(10))", class = "b", coef = "age_sq"),
+  set_prior("student_t(3, 0, 25)", class = "sigma") # More diffuse
+)
+
+# Fit model with alternative prior
+fit_sigma_diffuse <- brm(
+  formula = model_formula, data = phd_data, 
+  prior = priors_sigma_diffuse,
+  chains = 2, iter = 4000, warmup = 2000, seed = 789, 
+  silent = 2, refresh = 0
+)
+
+# Compare estimates
+main_sigma <- summary(model_phd)$spec_pars["sigma", "Estimate"]
+alt_sigma <- summary(fit_sigma_diffuse)$spec_pars["sigma", "Estimate"]
+
+# Calculate relative difference
+rel_diff <- abs(main_sigma - alt_sigma) / main_sigma * 100
+cat("Relative difference:", rel_diff, "%\n")
+# Rule of thumb: < 10% difference suggests robustness
+```
+
+---
+
+## Step 7: Prior Sensitivity - Results
+
+\scriptsize
+
+```{r step7_results, echo=FALSE, fig.height=4, out.width="80%", error=FALSE, message=FALSE, warning=FALSE}
+if (!is.null(phd_data) && model_fitted) {
+  tryCatch({
+    cat("=== Prior Sensitivity Analysis ===\n")
+    
+    # Alternative prior for sigma (more diffuse)
+    priors_sigma_diffuse <- c(
+      set_prior("normal(-35, sqrt(20))", class = "b",coef ="Intercept"),
+      set_prior("normal(0.8, sqrt(5))", class = "b", coef = "age"),
+      set_prior("normal(0, sqrt(10))", class = "b", coef = "age_sq"),
+      set_prior("student_t(3, 0, 25)", class = "sigma") # More diffuse
+    )
+invisible(capture.output(
+suppressMessages(suppressWarnings(
+    fit_sigma_diffuse <- brm(
+      formula = model_formula, data = phd_data, 
+      prior = priors_sigma_diffuse,
+      chains = 2, iter = 4000, warmup = 2000, seed = 789, 
+      silent = 2, refresh = 0,  open_progress = FALSE
+    )
+))))
+    
+    # Compare all parameter estimates
+    main_estimates <- summary(model_phd)$fixed[, "Estimate"]
+    alt_estimates <- summary(fit_sigma_diffuse)$fixed[, "Estimate"]
+    
+    # Compare sigma specifically
+    main_sigma <- summary(model_phd)$spec_pars["sigma", "Estimate"]
+    alt_sigma <- summary(fit_sigma_diffuse)$spec_pars["sigma", "Estimate"]
+    
+    cat("Fixed Effects Comparison:\n")
+    comparison_table <- data.frame(
+      Parameter = rownames(summary(model_phd)$fixed),
+      Original = round(main_estimates, 3),
+      Alternative = round(alt_estimates, 3),
+      Rel_Diff_Pct = round(abs(main_estimates - alt_estimates) / abs(main_estimates) * 100, 2)
+    )
+    print(comparison_table)
+    
+    cat("\nSigma (Residual SD) Comparison:\n")
+    cat("Original prior: student_t(3, 0, 15)\n")
+    cat("Alternative prior: student_t(3, 0, 25)\n")
+    cat("Original estimate:", round(main_sigma, 3), "\n")
+    cat("Alternative estimate:", round(alt_sigma, 3), "\n")
+    rel_diff_sigma <- abs(main_sigma - alt_sigma) / main_sigma * 100
+    cat("Relative difference:", round(rel_diff_sigma, 2), "%\n")
+    
+    
+    # Interpretation
+    max_diff <- max(rel_diffs)
+    if(max_diff < 5) {
+      cat("\n[CHECKMARK] ROBUST: All differences < 5%\n")
+    } else if(max_diff < 10) {
+      cat("\n[WARNING] MODERATELY ROBUST: All differences < 10%\n")
+    } else {
+      cat("\n[X] SENSITIVE: Some differences > 10%, investigate further\n")
+    }
+    
+  }, error = function(e) {
+    cat("Prior sensitivity analysis failed:", e$message, "\n")
+    
+    # Demonstrate concept with simulated results
+    par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+    
+    # Robust scenario
+    params <- c("Intercept", "Age", "Age2", "Sigma")
+    original <- c(-30, 0.8, -0.01, 15)
+    robust_alt <- c(-29.5, 0.82, -0.009, 15.3)
+    
+    plot(1:4, original, pch = 16, col = "blue", cex = 1.5,
+         ylim = range(c(original, robust_alt)),
+         main = "ROBUST: Small Changes",
+         xlab = "", ylab = "Estimate", xaxt = "n")
+    points(1:4 + 0.1, robust_alt, pch = 17, col = "red", cex = 1.5)
+    axis(1, at = 1:4, labels = params)
+    
+    # Sensitive scenario
+    sensitive_alt <- c(-25, 1.2, -0.02, 18)
+    plot(1:4, original, pch = 16, col = "blue", cex = 1.5,
+         ylim = range(c(original, sensitive_alt)),
+         main = "SENSITIVE: Large Changes",
+         xlab = "", ylab = "Estimate", xaxt = "n")
+    points(1:4 + 0.1, sensitive_alt, pch = 17, col = "red", cex = 1.5)
+    axis(1, at = 1:4, labels = params)
+    
+    par(mfrow = c(1, 1))
+  })
+} else {
+  cat("Prior sensitivity analysis not available\n")
+  
+  # Conceptual demonstration
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  
+  # Show how different priors can affect results
+  x <- seq(10, 20, length.out = 100)
+  
+  # Original prior effect
+  prior1 <- dnorm(x, 15, 2)
+  likelihood <- dnorm(x, 14, 1)
+  posterior1 <- prior1 * likelihood
+  posterior1 <- posterior1 / sum(posterior1)
+  
+  plot(x, prior1, type = "l", col = "blue", lwd = 2, ylim = c(0, max(posterior1)),
+       main = "Prior Influence on Posterior",
+       xlab = "Parameter Value", ylab = "Density")
+  lines(x, likelihood, col = "black", lwd = 2)
+  lines(x, posterior1, col = "red", lwd = 3)
+  legend("topright", c("Prior", "Likelihood", "Posterior"), 
+         col = c("blue", "black", "red"), lwd = c(2, 2, 3))
+  
+  # Sensitivity comparison
+  rel_diffs <- c(2, 1.5, 3, 8)
+  params <- c("beta0", "beta1", "beta2", "sigma")
+  barplot(rel_diffs, names.arg = params,
+          main = "Example: Prior Sensitivity",
+          ylab = "Relative Difference (%)",
+          col = c("lightgreen", "lightgreen", "lightgreen", "yellow"))
+  abline(h = 5, col = "orange", lty = 2)
+  abline(h = 10, col = "red", lty = 2)
+  
+  par(mfrow = c(1, 1))
+  
+  cat("Prior Sensitivity Guidelines:\n")
+  cat("< 5%: Very robust\n")
+  cat("5-10%: Moderately robust\n") 
+  cat("> 10%: Potentially sensitive, investigate\n")
+}
+```
+
+---
+
+```{r}
+    # Visualization
+    par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+    
+    # Compare estimates visually
+    params <- c("Intercept", "Age", "Age2", "Sigma")
+    original <- c(main_estimates, main_sigma)
+    alternative <- c(alt_estimates, alt_sigma)
+    
+    x_pos <- 1:4
+    plot(x_pos, original, pch = 16, col = "blue", cex = 1.5,
+         xlim = c(0.5, 4.5), ylim = range(c(original, alternative)),
+         main = "Parameter Estimates Comparison",
+         xlab = "", ylab = "Estimate Value", xaxt = "n")
+    points(x_pos + 0.1, alternative, pch = 17, col = "red", cex = 1.5)
+    axis(1, at = x_pos, labels = params)
+    legend("topright", c("Original Prior", "Alternative Prior"), 
+           pch = c(16, 17), col = c("blue", "red"))
+    
+    # Plot relative differences
+    rel_diffs <- c(abs(main_estimates - alt_estimates) / abs(main_estimates) * 100, rel_diff_sigma)
+    barplot(rel_diffs, names.arg = params, 
+            main = "Relative Differences (%)",
+            ylab = "Relative Difference (%)", col = "lightblue")
+    abline(h = 10, col = "red", lty = 2)
+    text(2, 12, "10% threshold", col = "red")
+    
+    par(mfrow = c(1, 1))
+
+```
+
+
+
+---
+
+# Step 8: Diffuse Prior Comparison & Full Sensitivity
+
+### Purpose of Step 8
+- Understand overall influence of prior choices
+- **Manual Method**: Compare with very vague, diffuse priors
+- **Automated Method**: Use tools like `priorsense` for comprehensive analysis
+
+---
+
+## Step 8: Diffuse Prior Comparison  & Full Sensitivity- Code Implementation
+
+\scriptsize
+```{r step8_code, echo=TRUE, eval=FALSE}
+# Define very diffuse/non-informative priors
+priors_diffuse <- c(
+  set_prior("normal(0, 100)", class = "b",coef="Intercept"),    # Very wide
+  set_prior("normal(0, 50)", class = "b"),             # Very wide for all b
+  set_prior("student_t(3, 0, 50)", class = "sigma")    # Very wide for sigma
+)
+
+# Fit model with diffuse priors
+model_diffuse <- brm(
+  formula = model_formula, data = phd_data, 
+  prior = priors_diffuse,
+  chains = 2, iter = 4000, warmup = 2000, seed = 101112, 
+  silent = 2, refresh = 0,  open_progress = FALSE
+)
+
+# Compare fixed effects estimates
+cat("Informative vs Diffuse Prior Comparison:\n")
+print(summary(model_phd)$fixed[, c("Estimate", "l-95% CI", "u-95% CI")])
+print(summary(model_diffuse)$fixed[, c("Estimate", "l-95% CI", "u-95% CI")])
+
+# Automated sensitivity with priorsense (if available)
+library(priorsense)
+ps_analysis <- powerscale_sensitivity(model_phd)
+plot(ps_analysis)
+```
+
+---
+
+## Step 8: Diffuse Prior Comparison - Results
+
+\scriptsize
+```{r step8_results, echo=FALSE, fig.height=4.8, out.width="85%",eror=FALSE,message=FALSE,warning=FALSE}
+# Part A: Manual diffuse prior comparison
+if (!is.null(phd_data) && model_fitted) {
+  tryCatch({
+    cat("=== Manual Diffuse Prior Comparison ===\n")
+    
+    # Define diffuse priors
+    priors_diffuse <- c(
+      set_prior("normal(0, 100)", class = "b", coef="Intercept"),
+      set_prior("normal(0, 50)", class = "b"),
+      set_prior("student_t(3, 0, 50)", class = "sigma")
+    )
+
+invisible(capture.output(
+    suppressMessages(
+    model_diffuse <- brm(
+      formula = model_formula, data = phd_data, 
+      prior = priors_diffuse,
+      chains = 2, iter = 4000, warmup = 2000, seed = 101112, 
+       refresh = 0,  silent = 2,
+  open_progress = FALSE
+    )
+)))
+    
+    # Compare estimates
+    main_est <- summary(model_phd)$fixed[, c("Estimate", "l-95% CI", "u-95% CI")]
+    diff_est <- summary(model_diffuse)$fixed[, c("Estimate", "l-95% CI", "u-95% CI")]
+    
+    cat("Informative Priors:\n")
+    print(round(main_est, 3))
+    cat("\nDiffuse Priors:\n")
+    print(round(diff_est, 3))
+    
+    # Calculate differences
+    est_diff <- abs(main_est[, "Estimate"] - diff_est[, "Estimate"])
+    rel_diff <- est_diff / abs(main_est[, "Estimate"]) * 100
+    
+    cat("\nRelative Differences (%):\n")
+    diff_summary <- data.frame(
+      Parameter = rownames(main_est),
+      Informative = round(main_est[, "Estimate"], 3),
+      Diffuse = round(diff_est[, "Estimate"], 3),
+      Rel_Diff_Pct = round(rel_diff, 2)
+    )
+    print(diff_summary)
+    
+    
+  }, error = function(e) {
+    cat("Diffuse prior comparison failed:", e$message, "\n")
+  })
+} else {
+  cat("Manual diffuse prior comparison not available\n")
+}
+
+```
+
+---
+
+```{r}
+  # Visualization
+    par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+    
+    # Parameter comparison plot
+    n_params <- nrow(main_est)
+    plot(1:n_params, main_est[, "Estimate"], pch = 16, col = "blue", cex = 1.5,
+         xlim = c(0.5, n_params + 0.5), 
+         ylim = range(c(main_est[, "Estimate"], diff_est[, "Estimate"])),
+         main = "Estimates: Informative vs Diffuse",
+         xlab = "", ylab = "Estimate", xaxt = "n")
+    points(1:n_params + 0.1, diff_est[, "Estimate"], pch = 17, col = "red", cex = 1.5)
+    axis(1, at = 1:n_params, labels = rownames(main_est), cex.axis = 0.8)
+    legend("topright", c("Informative", "Diffuse"), 
+           pch = c(16, 17), col = c("blue", "red"))
+    
+    # Relative differences
+    barplot(rel_diff, names.arg = rownames(main_est),
+            main = "Relative Differences (%)",
+            ylab = "Relative Difference (%)", col = "lightcoral",
+            cex.names = 0.8)
+    abline(h = 10, col = "red", lty = 2)
+    text(2, 12, "10% threshold", col = "red")
+    
+    par(mfrow = c(1, 1))
+  
+```
+
+
+---
+
+
+\scriptsize
+```{r step8_priorsense, echo=FALSE}
+# Part B: Automated sensitivity with priorsense  
+cat("\n=== Automated Prior Sensitivity (priorsense) ===\n")
+if (model_fitted && priorsense_available) {
+  tryCatch({
+    ps_analysis <- powerscale_sensitivity(model_phd)
+    
+    cat("Prior sensitivity summary:\n")
+    print(ps_analysis)
+    
+    # Create sensitivity plot
+    plot(ps_analysis) +
+      ggtitle("Prior Sensitivity Analysis with priorsense") +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 8))
+    
+    cat("\nInterpretation: Low sensitivity values (< 0.1) indicate robust results\n")
+    
+  }, error = function(e) {
+    cat("priorsense analysis failed:", e$message, "\n")
+    
+    # Manual demonstration of priorsense concept
+    par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+    
+    params <- c("Intercept", "Age", "Age2", "Sigma")
+    sensitivity <- c(0.02, 0.05, 0.08, 0.15)
+    colors <- ifelse(sensitivity < 0.1, "lightgreen", "orange")
+    
+    barplot(sensitivity, names.arg = params,
+            main = "Prior Sensitivity Measures (Example)",
+            ylab = "Sensitivity", col = colors)
+    abline(h = 0.1, col = "red", lty = 2)
+    text(2, 0.12, "Threshold = 0.1", col = "red")
+    legend("topright", c("Low sensitivity", "High sensitivity"),
+           fill = c("lightgreen", "orange"))
+  })
+} else {
+  if (!exists("priorsense_available") || !priorsense_available) {
+    cat("priorsense package not available\n")
+  } else {
+    cat("Model not fitted\n")
+  }
+  
+  # Conceptual demonstration
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  
+  # Show effect of prior informativeness
+  x <- seq(-2, 4, length.out = 100)
+  
+  # Informative prior scenario
+  prior_info <- dnorm(x, 1, 0.5)
+  likelihood <- dnorm(x, 0.8, 0.3)
+  posterior_info <- prior_info * likelihood
+  posterior_info <- posterior_info / max(posterior_info)
+  
+  plot(x, prior_info/max(prior_info), type = "l", col = "blue", lwd = 2,
+       main = "Informative Prior Influence",
+       xlab = "Parameter Value", ylab = "Relative Density")
+  lines(x, likelihood/max(likelihood), col = "black", lwd = 2)
+  lines(x, posterior_info, col = "red", lwd = 3)
+  legend("topright", c("Prior", "Likelihood", "Posterior"),
+         col = c("blue", "black", "red"), lwd = c(2, 2, 3))
+  
+  # Diffuse prior scenario  
+  prior_diffuse <- dnorm(x, 1, 2)  # Much wider
+  posterior_diffuse <- prior_diffuse * likelihood
+  posterior_diffuse <- posterior_diffuse / max(posterior_diffuse)
+  
+  plot(x, prior_diffuse/max(prior_diffuse), type = "l", col = "blue", lwd = 2,
+       main = "Diffuse Prior Influence", 
+       xlab = "Parameter Value", ylab = "Relative Density")
+  lines(x, likelihood/max(likelihood), col = "black", lwd = 2)
+  lines(x, posterior_diffuse, col = "red", lwd = 3)
+  legend("topright", c("Prior", "Likelihood", "Posterior"),
+         col = c("blue", "black", "red"), lwd = c(2, 2, 3))
+  
+  par(mfrow = c(1, 1))
+}
+```
+
+---
+
+# Step 9: Model Sensitivity Analysis
+
+### Purpose of Step 9
+- Test robustness to model specification (likelihood function)
+- Compare main model with plausible alternatives
+- Use **LOO-CV** (Leave-One-Out Cross-Validation) for model comparison
+
+---
+
+## Step 9: Model Comparison - Code Implementation
+
+\scriptsize
+```{r step9_code, echo=TRUE, eval=FALSE}
+# Fit simpler linear model (without quadratic term)
+ invisible(capture.output(
+     suppressMessages(suppressWarnings(
+model_linear <- brm(
+  bf(delay ~ 0+Intercept+age), data = phd_data,
+  prior = priors_main_model[c(1,2,4), ], 
+  chains = 2, iter = 4000, warmup = 2000, seed = 123, 
+  silent = 2, refresh = 0,  open_progress = FALSE
+)
+))))
+# Add LOO criteria for model comparison
+#model_phd_loo <- add_criterion(model_phd, "loo")
+#model_linear_loo <- add_criterion(model_linear, "loo")
+
+# Compare models using LOO-CV
+comparison <- loo_compare(model_phd, model_linear)
+print(comparison)
+
+# Interpretation guidelines:
+# - elpd_diff: difference in expected log pointwise predictive density
+# - se_diff: standard error of the difference
+# - If |elpd_diff| > 2*se_diff: significant difference
+# - Positive elpd_diff favors the first model (polynomial)
+# - Models within 2*se can be considered similar
+```
+
+---
+
+## Step 9: Model Comparison - Results
+
+\scriptsize
+```{r step9_results, echo=FALSE, fig.height=4.5, out.width="90%"}
+ 
+if (!is.null(phd_data) && model_fitted) {
+  tryCatch({
+    cat("=== Model Sensitivity Analysis ===\n")
+    cat("Comparing polynomial model vs simpler linear model\n\n")
+    
+    # Fit simpler linear model
+    invisible(capture.output(
+suppressMessages(suppressWarnings(
+    model_linear <- brm(
+      bf(delay ~ 0+Intercept+age), data = phd_data,
+      prior = priors_main_model2[c(1,2,4), ],
+      chains = 2, iter = 4000, warmup = 2000, seed = 123, 
+      silent = 2, refresh = 0
+    )
+)))) 
+    # Add LOO criteria and compare
+    model_phd_loo <- add_criterion(model_phd, "loo")
+    model_linear_loo <- add_criterion(model_linear, "loo")
+    
+    comparison <- loo_compare(model_phd_loo, model_linear_loo)
+    #print(comparison)
+    
+    # Extract comparison metrics
+    elpd_diff <- comparison[2, "elpd_diff"]
+    se_diff <- comparison[2, "se_diff"]
+    
+    cat("\nModel Comparison Interpretation:\n")
+    cat("ELPD difference:", round(elpd_diff, 2), "\n")
+    cat("SE of difference:", round(se_diff, 2), "\n")
+    cat("Difference/SE ratio:", round(abs(elpd_diff/se_diff), 2), "\n")
+    
+    if(abs(elpd_diff) > 2 * se_diff) {
+      if(elpd_diff > 0) {
+        cat("[CHECKMARK] Polynomial model significantly better (|diff| > 2*SE)\n")
+      } else {
+        cat("[CHECKMARK] Linear model significantly better (|diff| > 2*SE)\n")
+      }
+    } else {
+      cat("[APPROX] Models are similar (|diff| < 2*SE)\n")
+    }
+    
+    
+    cat("\nModel Weights (Pseudo-BMA):\n")
+    weight_summary <- data.frame(
+      Model = models,
+      Weight = round(weights, 3),
+      Percent = paste0(round(weights*100, 1), "%")
+    )
+    print(weight_summary)
+    
+  }, error = function(e) {
+    cat("Model comparison failed:", e$message, "\n")
+    
+    # Demonstrate model comparison concepts
+    par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+    
+    # Example 1: Clear preference
+    models1 <- c("Complex\nModel", "Simple\nModel")
+    elpd1 <- c(-200, -250)
+    se1 <- c(15, 18)
+    
+    bp1 <- barplot(elpd1, names.arg = models1,
+                   main = "Clear Model Preference",
+                   ylab = "ELPD", col = c("lightgreen", "lightcoral"),
+                   ylim = c(-280, -180))
+    arrows(bp1, elpd1 - se1, bp1, elpd1 + se1,
+           angle = 90, code = 3, length = 0.1)
+    text(1.5, -220, "Difference > 2xSE\nComplex model preferred", cex = 0.8)
+    
+    # Example 2: Similar models
+    elpd2 <- c(-200, -205)
+    se2 <- c(15, 15)
+    
+    bp2 <- barplot(elpd2, names.arg = models1,
+                   main = "Similar Models",
+                   ylab = "ELPD", col = c("lightyellow", "lightyellow"),
+                   ylim = c(-230, -180))
+    arrows(bp2, elpd2 - se2, bp2, elpd2 + se2,
+           angle = 90, code = 3, length = 0.1)
+    text(1.5, -210, "Difference < 2xSE\nModels similar", cex = 0.8)
+    
+    par(mfrow = c(1, 1))
+  })
+} else {
+  cat("Model comparison not available\n")
+  
+  # Conceptual demonstration
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  
+  # Demonstrate different model selection scenarios
+  models <- c("Linear", "Quadratic", "Cubic")
+  
+  # Scenario 1: Quadratic is best
+  elpd_scenario1 <- c(-180, -160, -165)
+  se_scenario1 <- c(12, 10, 11)
+  
+  bp1 <- barplot(elpd_scenario1, names.arg = models,
+                 main = "Quadratic Model Preferred",
+                 ylab = "ELPD", col = c("lightcoral", "lightgreen", "lightyellow"))
+  arrows(bp1, elpd_scenario1 - se_scenario1, bp1, elpd_scenario1 + se_scenario1,
+         angle = 90, code = 3, length = 0.1)
+  
+  # Scenario 2: Overfitting (simpler is better)
+  elpd_scenario2 <- c(-160, -165, -175)
+  se_scenario2 <- c(10, 12, 15)
+  
+  bp2 <- barplot(elpd_scenario2, names.arg = models,
+                 main = "Linear Model Preferred\n(Overfitting Avoided)",
+                 ylab = "ELPD", col = c("lightgreen", "lightyellow", "lightcoral"))
+  arrows(bp2, elpd_scenario2 - se_scenario2, bp2, elpd_scenario2 + se_scenario2,
+         angle = 90, code = 3, length = 0.1)
+  
+  par(mfrow = c(1, 1))
+  
+  cat("Model Comparison Guidelines:\n")
+  cat("- Higher ELPD = better predictive performance\n")
+  cat("- |elpd_diff| > 2xSE = significant difference\n")
+  cat("- Consider parsimony: simpler model if similar performance\n")
+  cat("- Model weights show relative support\n")
+}
+```
+
+---
+
+
+# Step 10: Report Findings Bayesianly
+
+### Purpose of Step 10
+- Transparently report all key aspects of analysis
+- Present entire posterior distribution, not just point estimates
+- Include probability statements and uncertainty visualization
+
+---
+
+## Step 10: Bayesian Reporting - Code Implementation
+
+\scriptsize
+
+```{r step10_code, echo=TRUE, eval=FALSE}
+# Comprehensive posterior summary
+print(summary(model_phd))
+
+# Extract posterior draws for probability statements
+draws <- as_draws_df(model_phd)
+
+# Bayesian probability statements
+prob_negative_age2 <- mean(draws$b_age_sq < 0)
+prob_positive_age <- mean(draws$b_age > 0)
+prob_meaningful_age_effect <- mean(abs(draws$b_age) > 0.5)
+
+cat("=== Bayesian Probability Statements ===\n")
+cat("P(age-squared effect < 0):", round(prob_negative_age2, 3), "\n")
+cat("P(age effect > 0):", round(prob_positive_age, 3), "\n") 
+cat("P(|age effect| > 0.5):", round(prob_meaningful_age_effect, 3), "\n")
+
+# Posterior intervals (credible intervals)
+posterior_intervals <- posterior_interval(model_phd, prob = 0.95)
+print(posterior_intervals)
+
+# Visualize predicted relationship with uncertainty
+conditional_effects(model_phd, "age")
+```
+
+---
+
+## Step 10: Bayesian Results & Visualization
+
+\scriptsize
+```{r step10_summary_and_viz, echo=FALSE, fig.height=4.8, out.width="95%"}
+if(model_fitted) {
+  tryCatch({
+    cat("=== COMPREHENSIVE BAYESIAN ANALYSIS RESULTS ===\n\n")
+    
+    # Posterior summary
+    cat("POSTERIOR SUMMARY:\n")
+    model_summary <- summary(model_phd)
+    print(model_summary)
+    
+    # Probability statements
+    draws <- as_draws_df(model_phd)
+    prob_negative_age2 <- mean(draws$b_age_sq < 0, na.rm = TRUE)
+    prob_positive_age <- mean(draws$b_age > 0, na.rm = TRUE)
+    prob_meaningful_age_effect <- mean(abs(draws$b_age) > 0.5, na.rm = TRUE)
+    
+   })
+} else {
+  cat("Model not fitted - showing Bayesian reporting principles\n")
+  
+  # Demonstrate key Bayesian reporting concepts
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+  
+  # 1. Full posterior vs point estimate
+  x <- seq(-2, 4, length.out = 200)
+  y <- dnorm(x, 1, 0.6)
+  plot(x, y, type = "l", lwd = 3, col = "blue",
+       main = "Full Posterior vs Point Estimate",
+       xlab = "Parameter Value", ylab = "Density")
+  abline(v = 1, col = "red", lwd = 3, lty = 2)
+  legend("topright", c("Full posterior", "Point estimate"), 
+         col = c("blue", "red"), lty = c(1, 2), lwd = 3)
+  
+  # 2. Credible intervals
+  ci_vals <- c(0.5, 0.8, 0.9, 0.95, 0.99)
+  plot(1:5, ci_vals, pch = 16, cex = 2, col = "darkgreen",
+       main = "Credible Intervals",
+       xlab = "Interval Width", ylab = "Probability",
+       xaxt = "n", ylim = c(0, 1))
+  axis(1, at = 1:5, labels = paste0(ci_vals*100, "%"))
+  
+  # 3. Probability statements
+  prob_positive <- 0.85
+  prob_large <- 0.23
+  prob_negative <- 0.15
+  
+  probs <- c(prob_positive, prob_large, prob_negative)
+  labels <- c("P(beta > 0)", "P(beta > 1)", "P(beta < 0)")
+  colors <- c("green", "orange", "red")
+  
+  barplot(probs, names.arg = labels, main = "Probability Statements",
+          ylab = "Probability", col = colors, ylim = c(0, 1))
+  
+  # 4. Uncertainty visualization
+  x_pred <- 1:10
+  y_pred <- 2 + 0.5 * x_pred
+  y_lower <- y_pred - 1
+  y_upper <- y_pred + 1
+  
+  plot(x_pred, y_pred, type = "l", lwd = 3, col = "purple",
+       main = "Uncertainty Visualization",
+       xlab = "X", ylab = "Y", ylim = range(c(y_lower, y_upper)))
+  polygon(c(x_pred, rev(x_pred)), c(y_lower, rev(y_upper)),
+          col = rgb(0.5, 0, 0.5, 0.3), border = NA)
+  legend("bottomright", c("Prediction", "95% interval"),
+         col = c("purple", rgb(0.5, 0, 0.5, 0.3)), 
+         lty = c(1, NA), pch = c(NA, 15))
+  
+  par(mfrow = c(1, 1))
+  
+  cat("BAYESIAN REPORTING ESSENTIALS:\n")
+  cat("1. Report entire posterior distributions, not just point estimates\n")
+  cat("2. Use probability statements: P(parameter > threshold)\n")
+  cat("3. Show uncertainty with credible intervals\n")
+  cat("4. Visualize predicted relationships with uncertainty bands\n")
+  cat("5. Provide substantive interpretation in domain context\n")
+}
+```
+
+
+---
+
+\scriptsize
+
+```{r}
+   cat("\n=== BAYESIAN PROBABILITY STATEMENTS ===\n")
+    cat("P(quadratic age effect < 0):", round(prob_negative_age2, 3), "\n")
+    cat("P(linear age effect > 0):", round(prob_positive_age, 3), "\n")
+    cat("P(|age effect| > 0.5 months/year):", round(prob_meaningful_age_effect, 3), "\n")
+    
+    # Create comprehensive visualization
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+    
+    # 1. Posterior distributions
+    posterior_samples <- as.matrix(model_phd)
+    
+    # Intercept
+    hist(posterior_samples[, "b_Intercept"], main = "Posterior: Intercept",
+         xlab = "beta0 (months)", col = "lightblue", freq = FALSE, breaks = 30)
+    abline(v = quantile(posterior_samples[, "b_Intercept"], c(0.025, 0.975)), 
+           col = "red", lty = 2)
+    
+    # Age effect
+    hist(posterior_samples[, "b_age"], main = "Posterior: Age Effect",
+         xlab = "beta1 (months/year)", col = "lightgreen", freq = FALSE, breaks = 30)
+    abline(v = 0, col = "black", lty = 2)
+    abline(v = quantile(posterior_samples[, "b_age"], c(0.025, 0.975)), 
+           col = "red", lty = 2)
+    
+    # Age squared effect
+    hist(posterior_samples[, "b_age_sq"], main = "Posterior: Age2 Effect",
+         xlab = "beta2 (months/year2)", col = "lightyellow", freq = FALSE, breaks = 30)
+    abline(v = 0, col = "black", lty = 2)
+    abline(v = quantile(posterior_samples[, "b_age_sq"], c(0.025, 0.975)), 
+           col = "red", lty = 2)
+    
+    # 4. Predicted relationship
+    ages_pred <- seq(min(phd_data$age), max(phd_data$age), length.out = 100)
+    ages_sq_pred <- ages_pred^2
+    
+    # Generate predictions
+    n_draws <- min(200, nrow(posterior_samples))
+    pred_matrix <- matrix(NA, n_draws, length(ages_pred))
+    
+    for(i in 1:n_draws) {
+      pred_matrix[i, ] <- posterior_samples[i, "b_Intercept"] + 
+                          posterior_samples[i, "b_age"] * ages_pred + 
+                          posterior_samples[i, "b_age_sq"] * ages_sq_pred
+    }
+    
+    # Calculate quantiles
+    pred_median <- apply(pred_matrix, 2, median)
+    pred_lower <- apply(pred_matrix, 2, quantile, 0.025)
+    pred_upper <- apply(pred_matrix, 2, quantile, 0.975)
+    
+    # Plot predicted relationship
+    plot(ages_pred, pred_median, type = "l", lwd = 3, col = "blue",
+         main = "Predicted PhD Delay by Age",
+         xlab = "Age (years)", ylab = "Delay (months)",
+         ylim = range(c(pred_lower, pred_upper, phd_data$delay)))
+    
+    # Add uncertainty bands
+    polygon(c(ages_pred, rev(ages_pred)), 
+            c(pred_lower, rev(pred_upper)),
+            col = rgb(0, 0, 1, 0.2), border = NA)
+    
+    # Add data points
+    points(phd_data$age, phd_data$delay, pch = 16, col = rgb(0, 0, 0, 0.3), cex = 0.5)
+    
+    # Add legend
+    legend("topright", 
+           c("Posterior median", "95% credible interval", "Observed data"),
+           col = c("blue", rgb(0, 0, 1, 0.2), "black"),
+           lty = c(1, NA, NA), pch = c(NA, 15, 16), cex = 0.8)
+    
+    par(mfrow = c(1, 1))
+    
+ 
+```
+
+
+---
+
+**Key Features**: 
+
+- **Full Distributions**: Show entire posterior, not just point estimates
+- **Probability Statements**: P(effect > threshold) quantifies evidence  
+- **Uncertainty Visualization**: Credible intervals and prediction bands
+- **Substantive Interpretation**: Translate statistical results to domain meaning
+
+---
+
+# WAMBS Checklist: Key Benefits
+
+### Systematic Quality Assurance
+- **Prevents Common Pitfalls**: Hidden poor practices in prior specification and model checking
+- **Enhances Reproducibility**: Clear documentation of all analytical decisions
+- **Builds Confidence**: Multiple convergent lines of evidence for model validity
+
+### Integration with Research Workflow
+- **Pre-registration**: Document analysis plans before seeing data
+- **Transparent Reporting**: Share code, data, and complete analytical pipeline
+- **Peer Review**: Facilitate evaluation by providing systematic checks
+
+---
+
+### Educational Value
+- **Learning Tool**: Structured approach for understanding Bayesian workflow
+- **Best Practices**: Promotes sophisticated diagnostic thinking
+- **Quality Standards**: Raises bar for acceptable Bayesian analysis
+
+---
+
+# Best Practices & Recommendations
+
+### Start Simple, Build Complexity
+- Begin with straightforward models before adding complexity
+- Master basic WAMBS workflow on simple cases
+- Focus on understanding over superficial sophistication
+- Validate simpler models before extending
+
+### Collaborate & Document Everything
+- **Domain Expertise**: Consult subject matter experts for prior specification
+- **Documentation**: Maintain detailed logs of all modeling decisions
+- **Version Control**: Use Git for code and analysis tracking
+- **Reproducibility**: Ensure others can replicate your entire analysis
+
+
+---
+
+### Embrace Uncertainty
+- Report full posterior distributions, not just point estimates
+- Use probability statements instead of binary accept/reject decisions
+- Visualize uncertainty appropriately in all presentations
+- Acknowledge limitations and areas of model uncertainty
+
+---
+
+# Common WAMBS Implementation Challenges
+
+### Computational Considerations
+- **Model Fitting Time**: Complex models may require substantial computational resources
+- **Convergence Issues**: Some models may need careful tuning (adapt_delta, max_treedepth)
+- **Prior Sensitivity**: Comprehensive sensitivity analysis can be time-intensive
+
+### Practical Solutions
+- **Iterative Development**: Start with simpler versions, gradually increase complexity
+- **Parallel Computing**: Utilize multiple cores for MCMC sampling
+- **Diagnostic Prioritization**: Focus on most critical diagnostics first
+- **Automated Tools**: Leverage packages like `priorsense` for efficiency
+
+
+---
+
+### Reporting Challenges
+- **Space Limitations**: Journals may limit space for complete diagnostic reporting
+- **Audience Adaptation**: Tailor technical detail to intended audience
+- **Supplementary Materials**: Use appendices for complete diagnostic reports
+
+---
+
+# Future Directions & Advanced Topics
+
+### Methodological Extensions
+- **Cross-Validation**: Beyond LOO-CV to K-fold and other techniques
+- **Model Averaging**: Bayesian model averaging when multiple plausible models exist
+- **Hierarchical Models**: WAMBS application to multilevel and mixed-effects models
+- **Non-parametric Extensions**: Gaussian processes and other flexible approaches
+
+### Software Development
+- **Automated WAMBS**: Tools for automatic WAMBS report generation
+- **Interactive Diagnostics**: Shiny apps for exploratory WAMBS checking
+- **Integration**: WAMBS workflows in popular Bayesian packages
+
+---
+
+### Research Applications
+- **Field-Specific Guidelines**: Tailored WAMBS for psychology, economics, medicine
+- **Meta-Analysis**: WAMBS for Bayesian meta-analytic models
+- **Causal Inference**: WAMBS in causal modeling contexts
+
+---
+
+# Conclusions
+
+### WAMBS Checklist: Essential for Modern Bayesian Practice
+
+1. **Systematic Approach**: WAMBS provides comprehensive framework for Bayesian quality assurance
+2. **Transparency**: Every step documented and justified, enabling reproducible research
+3. **Robustness**: Multiple diagnostic approaches ensure reliable conclusions
+4. **Educational**: Promotes deeper understanding of Bayesian modeling principles
+
+### Implementation Recommendations
+
+- **Adopt Gradually**: Start with core diagnostics, build to full implementation
+- **Customize Appropriately**: Adapt WAMBS to your specific research context
+- **Integrate Early**: Build WAMBS into analysis workflow from project start
+- **Share Widely**: Contribute to community by sharing WAMBS implementations
+
+### Final Message
+> *"The goal is not to follow WAMBS blindly, but to develop the habit of careful, systematic thinking about all aspects of Bayesian analysis."*
+
+---
+
+# Questions & Discussion
+
+### Thank you for your attention!
+
+**Contact Information:**
+
+- Email: [madsyair[at]stis.ac.id]
+- GitHub: [github.com/madsyair]
+- ORCID: [0000-0001-7088-0646]
+
+### Resources for Further Learning
+
+- **WAMBS Tutorial**: Depaoli & Van de Schoot (2017)
+- **brms Documentation**: Paul Buerkner's comprehensive guides
+- **Bayesian Workflow**: Gelman et al. (2020)
+- **Stan User's Guide**: mc-stan.org
+
+### Key Takeaway
+
+*Bayesian analysis is powerful, but with great power comes great responsibility for careful, transparent, and systematic implementation.*
+
+# References
+
+- Aki Vehtari, Andrew Gelman, Daniel Simpson, Bob Carpenter, Paul-Christian Bürkner. "Rank-Normalization, Folding, and Localization: An Improved $\widehat{R}$ for Assessing Convergence of MCMC (with Discussion)." Bayesian Analysis, 16(2) 667-718 June 2021.
+https://doi.org/10.1214/20-BA1221
+
+- Bürkner, P.-C. (2017). brms: An R package for Bayesian multilevel models using Stan. *Journal of Statistical Software*, 80(1), 1-28. https://doi.org/10.18637/jss.v080.i01
+
+- Depaoli, S., & Van de Schoot, R. (2017). Improving transparency and replication in Bayesian statistics: The WAMBS-Checklist. *Psychological Methods*, 22(2),  240-261.
+
+
+- Gelman, A., Vehtari, A., Simpson, D., et L.  (2020). Bayesian Workflow [Preprint]. arXiv. https://doi.org/10.48550/arXiv.2011.01808 
+
+- Kallioinen, N., Paananen, T., Bürkner, PC. et al. Detecting and diagnosing prior and likelihood sensitivity with power-scaling. *Statistical Computing* 34, 57 (2024). https://doi.org/10.1007/s11222-023-10366-5
+
+- van de Schoot, R., Depaoli, S., King, R. et al. Bayesian statistics and modelling. Nat Rev Methods Primers 1, 1 (2021). https://doi.org/10.1038/s43586-020-00001-2
+
+
+
